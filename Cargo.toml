@@ -1,0 +1,16 @@
+[package]
+name    = "vermon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow   = "1"
+axum     = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
+chrono   = { version = "0.4", features = ["serde"] }
+dashmap  = "6"
+futures  = "0.3"
+http     = "1"              # header constants
+octocrab = "0.44"
+semver   = "1"
+serde    = { version = "1", features = ["derive"] }
+tokio    = { version = "1", features = ["full"] }
