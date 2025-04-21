@@ -12,5 +12,6 @@ futures  = "0.3"
 http     = "1"              # header constants
 octocrab = "0.44"
 semver   = "1"
-serde    = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde    = { version = "1", features = ["derive"]}
 tokio    = { version = "1", features = ["full"] }
