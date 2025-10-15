@@ -90,7 +90,7 @@ static REPOS: &[RepoConfig] = &[
     },
     RepoConfig {
         owner: "ajuna-network",
-        name: "Ajuna",
+        name: "ajuna-parachain",
         prefix: "",
         networks: &["ajuna"],
         version_pattern: None,
@@ -160,6 +160,20 @@ static REPOS: &[RepoConfig] = &[
     },
 ];
 
+//────────────────── Usage tracking
+#[derive(Debug, Default)]
+struct UsageStats {
+    api_calls: DashMap<String, u64>,
+    last_updated: std::sync::RwLock<Option<DateTime<Utc>>>,
+}
+
+fn track_usage(stats: &UsageStats, endpoint: &str) {
+    stats.api_calls.entry(endpoint.to_string()).and_modify(|e| *e += 1).or_insert(1);
+    if let Ok(mut last) = stats.last_updated.write() {
+        *last = Some(Utc::now());
+    }
+}
+
 //────────────────── Models
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct VersionInfo {
@@ -183,6 +197,8 @@ struct NetworkInfo {
 struct ComparisonResult {
     network: String,
     repository_version: Option<String>,
+    repository_url: Option<String>,
+    repository_tag: Option<String>,
     runtime_version: Option<String>,
     client_version: Option<String>,
     matches: bool,
@@ -283,64 +299,69 @@ struct IbpProvider {
     ips: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct IbpMembersConfig {
-    members: HashMap<String, IbpMember>,
-}
 
 #[derive(Debug, Clone, Deserialize)]
 struct IbpMember {
-    name: String,
-    #[serde(default)]
-    website: Option<String>,
-    #[serde(default)]
-    logo: Option<String>,
-    membership: String,
-    #[serde(default)]
-    current_level: Option<String>,
-    #[serde(default)]
-    active: Option<String>,
-    #[serde(default)]
-    level_timestamp: Option<HashMap<String, String>>,
-    #[serde(default)]
-    services_address: String,
-    #[serde(default, deserialize_with = "deserialize_endpoints")]
-    endpoints: HashMap<String, String>,
-    #[serde(default)]
-    monitor_url: Option<String>,
-    #[serde(default)]
-    region: Option<String>,
-    #[serde(default)]
-    latitude: Option<String>,
-    #[serde(default)]
-    longitude: Option<String>,
-    #[serde(default)]
-    payments: Option<serde_json::Value>,
+    #[serde(rename = "Details")]
+    details: IbpMemberDetails,
+    #[serde(rename = "Membership")]
+    membership: IbpMemberMembership,
+    #[serde(rename = "Service")]
+    service: IbpMemberService,
+    #[serde(rename = "ServiceAssignments")]
+    service_assignments: HashMap<String, Vec<String>>,
+    #[serde(rename = "Location")]
+    location: IbpMemberLocation,
 }
 
-fn deserialize_endpoints<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-    let value = serde_json::Value::deserialize(deserializer)?;
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut result = HashMap::new();
-            for (k, v) in map {
-                if let serde_json::Value::String(s) = v {
-                    result.insert(k, s);
-                }
-            }
-            Ok(result)
-        }
-        serde_json::Value::Array(_) => {
-            // Empty array case - return empty HashMap
-            Ok(HashMap::new())
-        }
-        _ => Err(D::Error::custom("endpoints must be object or array")),
-    }
+#[derive(Debug, Clone, Deserialize)]
+struct IbpMemberDetails {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Website")]
+    website: String,
+    #[serde(rename = "Twitter")]
+    twitter: String,
+    #[serde(rename = "Element")]
+    element: String,
+    #[serde(rename = "Logo")]
+    logo: String,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+struct IbpMemberMembership {
+    #[serde(rename = "MemberLevel")]
+    member_level: u8,
+    #[serde(rename = "Joined")]
+    joined: u64,
+    #[serde(rename = "LastRankup")]
+    last_rankup: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IbpMemberService {
+    #[serde(rename = "Active")]
+    active: u8,
+    #[serde(rename = "ServiceIPv4")]
+    service_ipv4: String,
+    #[serde(rename = "ServiceIPv6")]
+    service_ipv6: String,
+    #[serde(rename = "MonitorUrl")]
+    monitor_url: String,
+    #[serde(rename = "PrometheusEndpoint")]
+    prometheus_endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IbpMemberLocation {
+    #[serde(rename = "Region")]
+    region: String,
+    #[serde(rename = "Latitude")]
+    latitude: f64,
+    #[serde(rename = "Longitude")]
+    longitude: f64,
+}
+
 
 //────────────────── State
 #[derive(Clone)]
@@ -351,6 +372,7 @@ struct AppState {
     runtime_versions: Arc<DashMap<String, String>>,
     client_versions: Arc<DashMap<String, String>>,
     member_info: Arc<DashMap<String, Vec<MemberInfo>>>,
+    usage_stats: Arc<UsageStats>,
     ibp_config: Arc<tokio::sync::RwLock<HashMap<String, IbpNetworkConfig>>>,
     ibp_members: Arc<tokio::sync::RwLock<HashMap<String, IbpMember>>>,
     gh: Octocrab,
@@ -538,13 +560,20 @@ async fn fetch_ibp_config() -> Result<HashMap<String, IbpNetworkConfig>> {
 }
 
 async fn fetch_ibp_members() -> Result<HashMap<String, IbpMember>> {
-    let url = "https://raw.githubusercontent.com/ibp-network/config/refs/heads/main/members.json";
+    let url = "https://raw.githubusercontent.com/ibp-network/config/refs/heads/main/members_professional.json";
     let client = reqwest::Client::new();
     let response = client.get(url).send().await?;
     let text = response.text().await?;
-    let config: IbpMembersConfig = serde_json::from_str(&text)
-        .context("Failed to deserialize members.json")?;
-    Ok(config.members)
+    let members: HashMap<String, IbpMember> = serde_json::from_str(&text)
+        .context("Failed to deserialize members_professional.json")?;
+    Ok(members)
+}
+
+async fn load_member_endpoints() -> HashMap<String, String> {
+    match std::fs::read_to_string("member_prometheus_endpoints.json") {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
 }
 
 async fn fetch_runtime_version(ws_url: &str) -> Result<(String, String)> {
@@ -633,7 +662,94 @@ async fn fetch_node_info_http(ip: &str, network: &str) -> Result<(String, String
     Ok((runtime_version, client_version))
 }
 
+//────────────────── Prometheus Metrics Queries
 
+#[derive(Debug, Deserialize)]
+struct PrometheusResponse {
+    status: String,
+    data: PrometheusData,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrometheusData {
+    #[serde(rename = "resultType")]
+    result_type: String,
+    result: Vec<PrometheusResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrometheusResult {
+    metric: HashMap<String, String>,
+    value: (f64, String),
+}
+
+async fn query_prometheus_metrics(query: &str, base_url: &str) -> Result<Vec<PrometheusResult>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    let url = format!("{}/api/v1/query?query={}",
+                     base_url, urlencoding::encode(query));
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .context("Failed to query Prometheus")?;
+
+    let prometheus_response: PrometheusResponse = response
+        .json()
+        .await
+        .context("Failed to parse Prometheus response")?;
+
+    if prometheus_response.status != "success" {
+        return Err(anyhow::anyhow!("Prometheus query failed"));
+    }
+
+    Ok(prometheus_response.data.result)
+}
+
+async fn fetch_node_info_prometheus(member_name: &str, network: &str, member: &IbpMember) -> Result<(String, String)> {
+    let base_url = member.service.prometheus_endpoint
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No Prometheus endpoint configured for member: {}", member_name))?;
+    // Query for runtime version using substrate_build_info metric
+    let build_query = format!(
+        r#"substrate_build_info{{member="{}", chain="{}"}}"#,
+        member_name, network
+    );
+
+    let build_results = query_prometheus_metrics(&build_query, base_url).await?;
+
+    let client_version = build_results
+        .iter()
+        .find_map(|result| result.metric.get("version"))
+        .ok_or_else(|| anyhow::anyhow!("No version found for {} on {}", member_name, network))?
+        .clone();
+
+    // Extract runtime spec version from the client version string
+    // Expected format: "polkadot-v1.15.1-78b9700ca8e"
+    let runtime_version = if let Some(captures) = regex::Regex::new(r"v(\d+\.\d+\.\d+)")
+        .unwrap()
+        .captures(&client_version)
+    {
+        captures.get(1).unwrap().as_str().to_string()
+    } else {
+        // Fallback: try to get runtime spec version directly
+        let runtime_query = format!(
+            r#"substrate_runtime_spec_version{{member="{}", chain="{}"}}"#,
+            member_name, network
+        );
+
+        let runtime_results = query_prometheus_metrics(&runtime_query, base_url).await?;
+        runtime_results
+            .first()
+            .map(|result| result.value.1.clone())
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+
+    Ok((runtime_version, client_version))
+}
 
 async fn refresh_chain_versions(state: Arc<AppState>) {
     info!("Refreshing on-chain runtime and client versions...");
@@ -667,37 +783,60 @@ async fn refresh_member_info(state: Arc<AppState>) {
     let ibp_members = state.ibp_members.read().await;
 
     for (member_id, member) in ibp_members.iter() {
-        if member.services_address.is_empty() {
+        if member.service.active == 0 || member.service.service_ipv4.is_empty() {
             continue;
         }
 
         let mut services = Vec::new();
 
-        for (network_key, _endpoint) in &member.endpoints {
-            let normalized = network_key.to_lowercase()
-                .replace("assethub", "asset-hub")
-                .replace("bridgehub", "bridge-hub");
+        // Process all service assignments for this member
+        for (_category, networks) in &member.service_assignments {
+            for network in networks {
+                let normalized = network.to_lowercase()
+                    .replace("assethub", "asset-hub")
+                    .replace("bridgehub", "bridge-hub")
+                    .replace("passet-hub", "asset-hub")
+                    .replace("eth-", "");
 
-            match fetch_node_info_http(&member.services_address, &normalized).await {
-                Ok((runtime_version, client_version)) => {
-                    info!("Member {} - {}: runtime={}, client={}", member_id, normalized, runtime_version, client_version);
-                    services.push(MemberInfo {
-                        network: normalized.clone(),
-                        ip: member.services_address.clone(),
-                        runtime_version: Some(runtime_version),
-                        client_version: Some(client_version),
-                        last_checked: Utc::now(),
-                    });
-                }
-                Err(e) => {
-                    warn!("Failed to fetch member info from {} for {}: {}", member_id, normalized, e);
-                    services.push(MemberInfo {
-                        network: normalized.clone(),
-                        ip: member.services_address.clone(),
-                        runtime_version: None,
-                        client_version: None,
-                        last_checked: Utc::now(),
-                    });
+                // Try Prometheus first, fallback to HTTP if needed
+                match fetch_node_info_prometheus(member_id, &normalized, member).await {
+                    Ok((runtime_version, client_version)) => {
+                        info!("Member {} - {}: runtime={}, client={} (from Prometheus)", member_id, normalized, runtime_version, client_version);
+                        services.push(MemberInfo {
+                            network: normalized.clone(),
+                            ip: member.service.service_ipv4.clone(),
+                            runtime_version: Some(runtime_version),
+                            client_version: Some(client_version),
+                            last_checked: Utc::now(),
+                        });
+                    }
+                    Err(e) => {
+                        warn!("Failed to fetch member info from Prometheus for {} on {}: {}, trying HTTP fallback", member_id, normalized, e);
+                        // Fallback to HTTP RPC call
+                        match fetch_node_info_http(&member.service.service_ipv4, &normalized).await {
+                            Ok((runtime_version, client_version)) => {
+                                info!("Member {} - {}: runtime={}, client={} (from HTTP fallback)", member_id, normalized, runtime_version, client_version);
+                                services.push(MemberInfo {
+                                    network: normalized.clone(),
+                                    ip: member.service.service_ipv4.clone(),
+                                    runtime_version: Some(runtime_version),
+                                    client_version: Some(client_version),
+                                    last_checked: Utc::now(),
+                                });
+                            }
+                            Err(http_e) => {
+                                warn!("Failed to fetch member info from both Prometheus and HTTP for {} on {}: Prometheus: {}, HTTP: {}",
+                                     member_id, normalized, e, http_e);
+                                services.push(MemberInfo {
+                                    network: normalized.clone(),
+                                    ip: member.service.service_ipv4.clone(),
+                                    runtime_version: None,
+                                    client_version: None,
+                                    last_checked: Utc::now(),
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -785,6 +924,7 @@ async fn list_networks(
     Query(params): Query<ListQuery>,
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<Json<Vec<NetworkInfo>>> {
+    track_usage(&state.usage_stats, "/api/networks");
     let mut networks: Vec<NetworkInfo> = state
         .network_map
         .iter()
@@ -813,6 +953,7 @@ async fn get_network(
     Path(network): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<Json<NetworkInfo>> {
+    track_usage(&state.usage_stats, "/api/networks/{network}");
     let repo = state
         .network_map
         .get(&network)
@@ -830,6 +971,7 @@ async fn get_network(
 async fn list_repos(
     State(state): State<Arc<AppState>>,
 ) -> Json<HashMap<String, VersionInfo>> {
+    track_usage(&state.usage_stats, "/api/repos");
     Json(
         state
             .repos
@@ -843,6 +985,7 @@ async fn get_repo(
     Path(repo): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<Json<VersionInfo>> {
+    track_usage(&state.usage_stats, "/api/repos/{repo}");
     state
         .repos
         .get(&repo)
@@ -851,6 +994,7 @@ async fn get_repo(
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthStatus> {
+    track_usage(&state.usage_stats, "/health");
     let uptime = Utc::now()
         .signed_duration_since(state.start_time)
         .num_seconds() as u64;
@@ -884,6 +1028,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthStatus> {
 async fn trigger_refresh(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    track_usage(&state.usage_stats, "/api/refresh");
     // Check if a refresh is already in progress
     let last_refresh = *state.last_refresh.read().await;
     if let Some(last) = last_refresh {
@@ -909,13 +1054,17 @@ async fn trigger_refresh(
 async fn compare_versions(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<ComparisonResult>> {
+    track_usage(&state.usage_stats, "/api/compare");
     let mut results = Vec::new();
 
     for entry in state.network_map.iter() {
         let network = entry.0;
         let repo = entry.1;
 
-        let repo_version = state.repos.get(repo.as_str()).map(|v| v.version.clone());
+        let repo_info = state.repos.get(repo.as_str());
+        let repo_version = repo_info.as_ref().map(|v| v.version.clone());
+        let repo_url = repo_info.as_ref().and_then(|v| v.release_notes_url.clone());
+        let repo_tag = repo_info.as_ref().map(|v| v.tag.clone());
         let runtime_version = state.runtime_versions.get(network.as_str()).map(|v| v.clone());
         let client_version = state.client_versions.get(network.as_str()).map(|v| v.clone());
 
@@ -923,10 +1072,11 @@ async fn compare_versions(
             (Some(rv), Some(cv)) => rv == cv,
             _ => false,
         };
-
         results.push(ComparisonResult {
             network: network.clone(),
             repository_version: repo_version,
+            repository_url: repo_url,
+            repository_tag: repo_tag,
             runtime_version,
             client_version,
             matches,
@@ -942,6 +1092,7 @@ async fn compare_network(
     Path(network): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<Json<ComparisonResult>> {
+    track_usage(&state.usage_stats, "/api/compare/{network}");
     let repo = state
         .network_map
         .get(&network)
@@ -956,9 +1107,14 @@ async fn compare_network(
         _ => false,
     };
 
+    let repo_info = state.repos.get(repo.as_str());
+    let repo_url = repo_info.as_ref().and_then(|v| v.release_notes_url.clone());
+    let repo_tag = repo_info.as_ref().map(|v| v.tag.clone());
     Ok(Json(ComparisonResult {
         network,
         repository_version: repo_version,
+        repository_url: repo_url,
+        repository_tag: repo_tag,
         runtime_version,
         client_version,
         matches,
@@ -969,6 +1125,7 @@ async fn compare_network(
 async fn list_members(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<MemberServices>> {
+    track_usage(&state.usage_stats, "/api/members");
     let mut results: Vec<MemberServices> = state
         .member_info
         .iter()
@@ -986,6 +1143,7 @@ async fn get_member(
     Path(member_id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<Json<MemberServices>> {
+    track_usage(&state.usage_stats, "/api/members/{provider}");
     let services = state
         .member_info
         .get(&member_id)
@@ -996,6 +1154,207 @@ async fn get_member(
         provider: member_id,
         services,
     }))
+}
+
+async fn get_usage_stats(
+    State(state): State<Arc<AppState>>,
+) -> Json<HashMap<String, u64>> {
+    track_usage(&state.usage_stats, "/api/stats");
+    Json(state.usage_stats.api_calls.iter().map(|e| (e.key().clone(), *e.value())).collect())
+}
+
+async fn serve_ui() -> impl IntoResponse {
+    (
+        [("content-type", "text/html")],
+        r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>vermon</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="terminal">
+<div class="header">vermon v0.4.0</div>
+<div class="controls">
+<button id="view-toggle">by network</button>
+<input id="filter" type="text" placeholder="filter">
+</div>
+<div id="status"></div>
+<div id="data"></div>
+</div>
+<script>
+const state={view:'network',filter:'',data:{networks:[],members:[],compare:[]}};
+
+function parseVersion(v){
+if(!v)return null;
+const match=v.match(/(\d+)\.(\d+)\.(\d+)/);
+return match?{major:parseInt(match[1]),minor:parseInt(match[2]),patch:parseInt(match[3]),raw:v}:null;
+}
+function isVersionMismatch(item){
+if(!item.repository_version||!item.runtime_version)return false;
+return item.repository_version!==item.runtime_version;
+}
+function isSemverOutdated(memberVersion,networkVersion){
+const mv=parseVersion(memberVersion);
+const nv=parseVersion(networkVersion);
+if(!mv||!nv)return false;
+// Only consider outdated if member version is actually lower
+// If major version differs, check which is higher
+if(mv.major!==nv.major){
+return mv.major<nv.major;
+}
+// If minor version differs, check which is higher
+if(mv.minor!==nv.minor){
+return mv.minor<nv.minor;
+}
+// If patch version differs, check which is higher
+return mv.patch<nv.patch;
+}
+
+function getMajorityVersion(versions){
+const validVersions=versions.filter(v=>v&&v!=='?'&&v!==null);
+if(validVersions.length===0)return null;
+const counts=validVersions.reduce((acc,v)=>{acc[v]=(acc[v]||0)+1;return acc},{});
+return Object.keys(counts).reduce((a,b)=>counts[a]>counts[b]?a:b);
+}
+function isLevel6Network(networkName){
+const level6Networks=['acala','ajuna','bifrost-polkadot','hydration','nexus','kilt','moonbeam','mythos','polimec','unique','xcavate'];
+return level6Networks.includes(networkName.toLowerCase());
+}
+
+function renderNetworkView(){
+if(!state.data.compare.length)return '<div>loading...</div>';
+const filtered=state.data.compare.filter(item=>
+state.filter===''||item.network.toLowerCase().includes(state.filter.toLowerCase()));
+
+const relayChains=filtered.filter(item=>['polkadot','kusama','paseo'].includes(item.network.toLowerCase()));
+const systemChains=filtered.filter(item=>item.network.toLowerCase().includes('-hub')||item.network.toLowerCase().includes('collectives')||item.network.toLowerCase().includes('coretime')||item.network.toLowerCase().includes('people')||item.network.toLowerCase().includes('encointer'));
+const level6Networks=filtered.filter(item=>isLevel6Network(item.network));
+const otherNetworks=filtered.filter(item=>!['polkadot','kusama','paseo'].includes(item.network.toLowerCase())&&!item.network.toLowerCase().includes('-hub')&&!item.network.toLowerCase().includes('collectives')&&!item.network.toLowerCase().includes('coretime')&&!item.network.toLowerCase().includes('people')&&!item.network.toLowerCase().includes('encointer')&&!isLevel6Network(item.network));
+
+function renderNetworkGroup(networks,title){
+if(!networks.length)return '';
+const content=networks.map(item=>{
+const mismatch=isVersionMismatch(item);
+const networkMembers=state.data.members.filter(m=>
+m.services.some(s=>s.network===item.network));
+const clientVersions=networkMembers.map(m=>{
+const service=m.services.find(s=>s.network===item.network);
+return service?service.client_version:null;
+}).filter(v=>v&&v!=='?'&&v!==null);
+const majorityVersion=getMajorityVersion(clientVersions);
+const members=networkMembers.map(m=>{
+const service=m.services.find(s=>s.network===item.network);
+const clientVer=service?service.client_version:null;
+const outdated=majorityVersion&&clientVer&&isSemverOutdated(clientVer,majorityVersion);
+const unreachable=!clientVer||clientVer==='?'||clientVer===null;
+let status='';
+let cssClass='';
+if(unreachable){status=' [unreachable]';cssClass=' class="unreachable"';}
+else if(outdated){status=' [!outdated]';cssClass=' class="outdated"';}
+return `<span${cssClass}>${m.provider}: ${clientVer||'?'}${status}</span>`;
+}).join(' | ');
+const repoInfo=state.data.networks.find(n=>n.network===item.network);
+const githubRepo=repoInfo?repoInfo.repository:'unknown';
+return `<div class="item ${mismatch?'invalid':'valid'}">
+<strong>${item.network}</strong>
+<div class="versions">
+github: ${githubRepo} | repo: ${item.repository_url?`<a href="${item.repository_url}" target="_blank">${item.repository_version||'?'}</a>`:item.repository_version||'?'}
+runtime: ${item.runtime_version||'?'} | majority: ${majorityVersion||'?'}
+</div>
+${members?`<div class="members">${members}</div>`:''}
+</div>`;
+}).join('');
+return `<div class="network-group">
+<div class="group-header">${title} (${networks.length})</div>
+${content}
+</div>`;
+}
+
+return [
+renderNetworkGroup(relayChains,'Relay Chains'),
+renderNetworkGroup(systemChains,'System Chains'),
+renderNetworkGroup(level6Networks,'Level 6 Parachains'),
+renderNetworkGroup(otherNetworks,'Other Networks')
+].filter(group=>group).join('');
+}
+
+function renderMemberView(){
+if(!state.data.members.length)return '<div>loading...</div>';
+const filtered=state.data.members.filter(member=>
+state.filter===''||member.provider.toLowerCase().includes(state.filter.toLowerCase()));
+return filtered.map(member=>{
+return `<div class="member">
+<strong>${member.provider}</strong>
+${member.services.map(s=>{
+const compItem=state.data.compare.find(c=>c.network===s.network);
+const mismatch=compItem&&s.runtime_version&&compItem.runtime_version&&s.runtime_version!==compItem.runtime_version;
+const unreachable=!s.runtime_version||s.runtime_version==='?'||!s.client_version||s.client_version==='?';
+const networkMembers=state.data.members.filter(m=>m.services.some(srv=>srv.network===s.network));
+const clientVersions=networkMembers.map(m=>{
+const service=m.services.find(srv=>srv.network===s.network);
+return service?service.client_version:null;
+}).filter(v=>v&&v!=='?'&&v!==null);
+const majorityVersion=getMajorityVersion(clientVersions);
+const outdated=majorityVersion&&s.client_version&&isSemverOutdated(s.client_version,majorityVersion);
+let serviceClass='service';
+if(unreachable)serviceClass+=' unreachable';
+else if(mismatch)serviceClass+=' invalid';
+else if(outdated)serviceClass+=' outdated';
+else serviceClass+=' valid';
+return `<div class="${serviceClass}">
+${s.network}: ${s.runtime_version||'?'} | ${s.client_version||'?'}
+</div>`;
+}).join('')}
+</div>`;
+}).join('');
+}
+
+function render(){
+document.getElementById('data').innerHTML=state.view==='network'?renderNetworkView():renderMemberView();
+}
+
+async function fetchData(){
+try{
+const[networks,members,compare]=await Promise.all([
+fetch('/api/networks').then(r=>r.json()),
+fetch('/api/members').then(r=>r.json()),
+fetch('/api/compare').then(r=>r.json())
+]);
+state.data={networks,members,compare};
+render();
+document.getElementById('status').textContent=`${compare.length} networks | ${members.length} members`;
+}catch(e){
+document.getElementById('status').textContent='error: '+e.message;
+}
+}
+
+document.getElementById('view-toggle').onclick=()=>{
+state.view=state.view==='network'?'member':'network';
+document.getElementById('view-toggle').textContent='by '+state.view;
+render();
+};
+
+document.getElementById('filter').oninput=e=>{
+state.filter=e.target.value;
+render();
+};
+
+fetchData();
+setInterval(fetchData,30000);
+</script>
+</body>
+</html>"#
+    )
+}
+
+async fn serve_css() -> impl IntoResponse {
+    (
+        [("content-type", "text/css")],
+        std::fs::read_to_string("/home/alice/rotko/vermon/static/style.css")
+            .unwrap_or_else(|_| "*{margin:0;padding:0;box-sizing:border-box}body{background:#000;color:#0f0;font-family:monospace;font-size:12px;padding:10px}input{background:#000;border:1px solid #333;color:#0f0;font-family:monospace;font-size:12px;padding:5px;outline:none}input:focus{border-color:#0f0}ul{list-style:none;margin-top:10px}li{padding:2px 0}li.valid{color:#0f0}li.invalid{color:#f00;background:#220}li.unknown{color:#888}ul li:hover{background:#111}".to_string())
+    )
 }
 
 //────────────────── Main
@@ -1094,23 +1453,13 @@ async fn main() -> Result<()> {
         start_time: Utc::now(),
         last_refresh: Arc::new(tokio::sync::RwLock::new(None)),
         failed_repos: Arc::new(DashMap::new()),
-    });
-
-    refresh_all(state.clone()).await;
-
-    let refresh_state = state.clone();
-    tokio::spawn(async move {
-        let mut interval = interval(config.refresh_interval);
-        loop {
-            interval.tick().await;
-            info!("Running scheduled refresh...");
-            refresh_all(refresh_state.clone()).await;
-        }
+        usage_stats: Arc::new(UsageStats::default()),
     });
 
     let app = Router::new()
-        .route("/", get(|| async { "Version Monitor API v0.4" }))
-        .route("/health", get(health))
+        .route("/", get(serve_ui))
+        .route("/style.css", get(serve_css))
+        .route("/api/health", get(health))
         .route("/api/networks", get(list_networks))
         .route("/api/networks/{network}", get(get_network))
         .route("/api/repos", get(list_repos))
@@ -1120,13 +1469,31 @@ async fn main() -> Result<()> {
         .route("/api/compare/{network}", get(compare_network))
         .route("/api/members", get(list_members))
         .route("/api/members/{provider}", get(get_member))
+        .route("/api/stats", get(get_usage_stats))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state.clone());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     info!("Server listening on {}", addr);
-    
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
+
+    let refresh_state = state.clone();
+    tokio::spawn(async move {
+        // Initial refresh
+        info!("Starting initial data refresh...");
+        refresh_all(refresh_state.clone()).await;
+        info!("Initial data refresh completed");
+
+        // Then start interval
+        let mut interval = interval(config.refresh_interval);
+        loop {
+            interval.tick().await;
+            info!("Running scheduled refresh...");
+            refresh_all(refresh_state.clone()).await;
+        }
+    });
+
     axum::serve(listener, app).await?;
     
     Ok(())
