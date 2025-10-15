@@ -1175,7 +1175,7 @@ async fn serve_ui() -> impl IntoResponse {
 </head>
 <body>
 <div class="terminal">
-<div class="header">vermon v0.4.0</div>
+<div class="header">vermon v0.4.1</div>
 <div class="controls">
 <button id="view-toggle">by network</button>
 <input id="filter" type="text" placeholder="filter">
