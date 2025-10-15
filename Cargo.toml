@@ -5,13 +5,20 @@ edition = "2021"
 
 [dependencies]
 anyhow   = "1"
-axum     = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
+axum     = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "query"] }
 chrono   = { version = "0.4", features = ["serde"] }
 dashmap  = "6"
+dotenvy  = "0.15"
 futures  = "0.3"
 http     = "1"              # header constants
+jsonrpsee = { version = "0.24", features = ["ws-client", "client"] }
 octocrab = "0.44"
+reqwest = { version = "0.12", features = ["json"] }
 semver   = "1"
 serde_json = "1"
 serde    = { version = "1", features = ["derive"]}
 tokio    = { version = "1", features = ["full"] }
+regex = "1.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.5", features = ["cors"] }
