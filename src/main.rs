@@ -607,7 +607,7 @@ async fn fetch_runtime_version(ws_url: &str) -> Result<(String, String)> {
 
 async fn fetch_node_info_http(ip: &str, network: &str) -> Result<(String, String)> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(3))
         .danger_accept_invalid_certs(true)
         .build()?;
 
@@ -727,15 +727,15 @@ async fn fetch_node_info_prometheus(member_name: &str, network: &str, member: &I
         .ok_or_else(|| anyhow::anyhow!("No version found for {} on {}", member_name, network))?
         .clone();
 
-    // Extract runtime spec version from the client version string
-    // Expected format: "polkadot-v1.15.1-78b9700ca8e"
-    let runtime_version = if let Some(captures) = regex::Regex::new(r"v(\d+\.\d+\.\d+)")
-        .unwrap()
-        .captures(&client_version)
-    {
-        captures.get(1).unwrap().as_str().to_string()
+    let runtime_version = if let Ok(regex) = regex::Regex::new(r"v(\d+\.\d+\.\d+)") {
+        if let Some(captures) = regex.captures(&client_version) {
+            captures.get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        } else {
+            "unknown".to_string()
+        }
     } else {
-        // Fallback: try to get runtime spec version directly
         let runtime_query = format!(
             r#"substrate_runtime_spec_version{{name=~"{}.*", chain="{}"}}"#,
             member_name, network
@@ -778,75 +778,228 @@ async fn refresh_chain_versions(state: Arc<AppState>) {
 }
 
 async fn refresh_member_info(state: Arc<AppState>) {
+    let start = std::time::Instant::now();
     info!("Refreshing IBP member node information...");
 
     let ibp_members = state.ibp_members.read().await;
 
-    for (member_id, member) in ibp_members.iter() {
-        if member.service.active == 0 || member.service.service_ipv4.is_empty() {
-            continue;
+    let (prometheus_members, http_members): (Vec<_>, Vec<_>) = ibp_members
+        .iter()
+        .filter(|(_, member)| member.service.active != 0 && !member.service.service_ipv4.is_empty())
+        .partition(|(_, member)| member.service.prometheus_endpoint.is_some());
+
+    let mut prometheus_futures = Vec::new();
+    for (member_id, member) in prometheus_members {
+        let endpoint = match member.service.prometheus_endpoint.as_ref() {
+            Some(ep) => ep,
+            None => {
+                warn!("Member {} has no Prometheus endpoint but was in prometheus_members", member_id);
+                continue;
+            }
+        };
+        let networks: Vec<_> = member.service_assignments.values()
+            .flatten()
+            .map(|n| n.to_lowercase()
+                .replace("assethub", "asset-hub")
+                .replace("bridgehub", "bridge-hub")
+                .replace("passet-hub", "asset-hub")
+                .replace("eth-", ""))
+            .collect();
+
+        prometheus_futures.push(fetch_member_prometheus_batch(member_id.clone(), networks, endpoint.clone()));
+    }
+
+    let mut http_futures = Vec::new();
+    for (member_id, member) in http_members {
+        let networks: Vec<_> = member.service_assignments.values()
+            .flatten()
+            .map(|n| n.to_lowercase()
+                .replace("assethub", "asset-hub")
+                .replace("bridgehub", "bridge-hub")
+                .replace("passet-hub", "asset-hub")
+                .replace("eth-", ""))
+            .collect();
+
+        http_futures.push(fetch_member_http_batch(member_id.clone(), member.service.service_ipv4.clone(), networks));
+    }
+
+    let (prometheus_results, http_results) = tokio::join!(
+        futures::future::join_all(prometheus_futures),
+        futures::future::join_all(http_futures)
+    );
+
+    let prom_count = prometheus_results.len();
+    let http_count = http_results.len();
+
+    for (member_id, services) in prometheus_results.into_iter().chain(http_results) {
+        if !services.is_empty() {
+            state.member_info.insert(member_id, services);
         }
+    }
 
-        let mut services = Vec::new();
+    let duration = start.elapsed();
+    info!("Member info refresh completed in {:?} ({} Prometheus, {} HTTP)",
+          duration, prom_count, http_count);
+}
 
-        // Process all service assignments for this member
-        for (_category, networks) in &member.service_assignments {
-            for network in networks {
-                let normalized = network.to_lowercase()
-                    .replace("assethub", "asset-hub")
-                    .replace("bridgehub", "bridge-hub")
-                    .replace("passet-hub", "asset-hub")
-                    .replace("eth-", "");
+async fn fetch_member_prometheus_batch(member_id: String, networks: Vec<String>, endpoint: String) -> (String, Vec<MemberInfo>) {
+    let mut services = Vec::new();
 
-                // Try Prometheus first, fallback to HTTP if needed
-                match fetch_node_info_prometheus(member_id, &normalized, member).await {
-                    Ok((runtime_version, client_version)) => {
-                        info!("Member {} - {}: runtime={}, client={} (from Prometheus)", member_id, normalized, runtime_version, client_version);
-                        services.push(MemberInfo {
-                            network: normalized.clone(),
-                            ip: member.service.service_ipv4.clone(),
-                            runtime_version: Some(runtime_version),
-                            client_version: Some(client_version),
-                            last_checked: Utc::now(),
-                        });
-                    }
-                    Err(e) => {
-                        warn!("Failed to fetch member info from Prometheus for {} on {}: {}, trying HTTP fallback", member_id, normalized, e);
-                        // Fallback to HTTP RPC call
-                        match fetch_node_info_http(&member.service.service_ipv4, &normalized).await {
-                            Ok((runtime_version, client_version)) => {
-                                info!("Member {} - {}: runtime={}, client={} (from HTTP fallback)", member_id, normalized, runtime_version, client_version);
-                                services.push(MemberInfo {
-                                    network: normalized.clone(),
-                                    ip: member.service.service_ipv4.clone(),
-                                    runtime_version: Some(runtime_version),
-                                    client_version: Some(client_version),
-                                    last_checked: Utc::now(),
-                                });
-                            }
-                            Err(http_e) => {
-                                warn!("Failed to fetch member info from both Prometheus and HTTP for {} on {}: Prometheus: {}, HTTP: {}",
-                                     member_id, normalized, e, http_e);
-                                services.push(MemberInfo {
-                                    network: normalized.clone(),
-                                    ip: member.service.service_ipv4.clone(),
-                                    runtime_version: None,
-                                    client_version: None,
-                                    last_checked: Utc::now(),
-                                });
-                            }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .pool_idle_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| warn!("Failed to create HTTP client: {}", e))
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    for network in networks {
+        let query = format!(r#"substrate_build_info{{name=~"{}.*", chain="{}"}}"#, member_id, network);
+        let url = format!("{}/api/v1/query?query={}", endpoint, urlencoding::encode(&query));
+
+        match client.get(&url).send().await {
+            Ok(response) => {
+                if let Ok(prom_response) = response.json::<PrometheusResponse>().await {
+                    if let Some(result) = prom_response.data.result.first() {
+                        if let Some(version) = result.metric.get("version") {
+                            info!("Member {} - {}: client={} (from Prometheus)", member_id, network, version);
+                            services.push(MemberInfo {
+                                network: network.clone(),
+                                ip: "prometheus".to_string(),
+                                runtime_version: extract_runtime_version(version),
+                                client_version: Some(version.clone()),
+                                last_checked: Utc::now(),
+                            });
+                            continue;
                         }
                     }
                 }
             }
+            Err(_) => {}
         }
 
-        if !services.is_empty() {
-            state.member_info.insert(member_id.clone(), services);
+        warn!("Prometheus query failed for {} on {}", member_id, network);
+    }
+
+    (member_id, services)
+}
+
+async fn fetch_member_http_batch(member_id: String, ip: String, networks: Vec<String>) -> (String, Vec<MemberInfo>) {
+    let mut services = Vec::new();
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(8)
+        .tcp_keepalive(Duration::from_secs(60))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let futures: Vec<_> = networks.iter()
+        .map(|network| fetch_node_info_http_optimized(&client, &ip, network))
+        .collect();
+
+    let results = futures::future::join_all(futures).await;
+
+    for (network, result) in networks.into_iter().zip(results.into_iter()) {
+        match result {
+            Ok((runtime_version, client_version)) => {
+                services.push(MemberInfo {
+                    network: network.clone(),
+                    ip: ip.clone(),
+                    runtime_version: Some(runtime_version),
+                    client_version: Some(client_version),
+                    last_checked: Utc::now(),
+                });
+            }
+            Err(_) => {
+                services.push(MemberInfo {
+                    network: network.clone(),
+                    ip: ip.clone(),
+                    runtime_version: None,
+                    client_version: None,
+                    last_checked: Utc::now(),
+                });
+            }
         }
     }
 
-    info!("Member info refresh completed");
+    (member_id, services)
+}
+
+async fn fetch_node_info_http_optimized(client: &reqwest::Client, ip: &str, network: &str) -> Result<(String, String)> {
+    let url = format!("https://{}:443", ip);
+    let geodns_host = format!("{}.dotters.network", network);
+
+    let strategies = [
+        ("Host", geodns_host.as_str()),
+        ("X-Forwarded-Host", geodns_host.as_str()),
+        ("X-Real-IP", "127.0.0.1"),
+    ];
+
+    for (header_name, header_value) in &strategies {
+        match try_rpc_call(client, &url, header_name, header_value).await {
+            Ok(result) => return Ok(result),
+            Err(_) => continue,
+        }
+    }
+
+    Err(anyhow::anyhow!("All header strategies failed for {}", network))
+}
+
+async fn try_rpc_call(client: &reqwest::Client, url: &str, header_name: &str, header_value: &str) -> Result<(String, String)> {
+    let runtime_response = client
+        .post(url)
+        .header(header_name, header_value)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "state_getRuntimeVersion",
+            "params": [],
+            "id": 1
+        }))
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+
+    let runtime_version = runtime_response
+        .get("result")
+        .and_then(|r| r.get("specVersion"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v.to_string())
+        .ok_or_else(|| anyhow::anyhow!("Invalid runtime version response"))?;
+
+    let client_response = client
+        .post(url)
+        .header(header_name, header_value)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "system_version",
+            "params": [],
+            "id": 1
+        }))
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+
+    let client_version = client_response
+        .get("result")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Invalid client version response"))?
+        .to_string();
+
+    Ok((runtime_version, client_version))
+}
+
+fn extract_runtime_version(version: &str) -> Option<String> {
+    regex::Regex::new(r"v(\d+\.\d+\.\d+)")
+        .ok()?
+        .captures(version)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
 }
 
 async fn refresh_all(state: Arc<AppState>) {
