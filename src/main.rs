@@ -715,7 +715,7 @@ async fn fetch_node_info_prometheus(member_name: &str, network: &str, member: &I
         .ok_or_else(|| anyhow::anyhow!("No Prometheus endpoint configured for member: {}", member_name))?;
     // Query for runtime version using substrate_build_info metric
     let build_query = format!(
-        r#"substrate_build_info{{member="{}", chain="{}"}}"#,
+        r#"substrate_build_info{{name=~"{}.*", chain="{}"}}"#,
         member_name, network
     );
 
@@ -737,7 +737,7 @@ async fn fetch_node_info_prometheus(member_name: &str, network: &str, member: &I
     } else {
         // Fallback: try to get runtime spec version directly
         let runtime_query = format!(
-            r#"substrate_runtime_spec_version{{member="{}", chain="{}"}}"#,
+            r#"substrate_runtime_spec_version{{name=~"{}.*", chain="{}"}}"#,
             member_name, network
         );
 
