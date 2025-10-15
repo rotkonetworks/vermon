@@ -23,7 +23,7 @@ jobs:
         run: |
           echo "${{ secrets.DEPLOY_KEY }}" > ssh_key
           chmod 600 ssh_key
-          ssh -i ssh_key -o StrictHostKeyChecking=no ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} << 'EOF'
+          ssh -i ssh_key -o StrictHostKeyChecking=no -p ${{ secrets.DEPLOY_HOST_PORT }} ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} << 'EOF'
             echo "${{ secrets.GITHUB_TOKEN }}" \
               | docker login ghcr.io \
                 --username "${{ github.actor }}" \
@@ -31,5 +31,7 @@ jobs:
             docker pull ghcr.io/${{ github.repository }}:latest
             docker stop vermon || true
             docker rm vermon || true
-            docker run -d --name vermon -p 3000:3000 --restart unless-stopped ghcr.io/${{ github.repository }}:latest
+            mkdir -p ~/vermon
+            echo "GITHUB_TOKEN=${{ secrets.TOKEN }}" > ~/vermon/.env
+            docker run -d --name vermon -p 4000:3000 --restart unless-stopped --env-file ~/vermon/.env ghcr.io/${{ github.repository }}:latest
           EOF
