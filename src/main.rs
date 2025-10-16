@@ -1699,7 +1699,7 @@ setInterval(fetchData,30000);
 async fn serve_css() -> impl IntoResponse {
     (
         [("content-type", "text/css")],
-        std::fs::read_to_string("/home/alice/rotko/vermon/static/style.css")
+        std::fs::read_to_string("static/style.css")
             .unwrap_or_else(|_| "*{margin:0;padding:0;box-sizing:border-box}body{background:#000;color:#0f0;font-family:monospace;font-size:12px;padding:10px}input{background:#000;border:1px solid #333;color:#0f0;font-family:monospace;font-size:12px;padding:5px;outline:none}input:focus{border-color:#0f0}ul{list-style:none;margin-top:10px}li{padding:2px 0}li.valid{color:#0f0}li.invalid{color:#f00;background:#220}li.unknown{color:#888}ul li:hover{background:#111}".to_string())
     )
 }

@@ -25,4 +25,4 @@ Uses Docker on port 3000:
 docker run -d --name vermon -p 3000:3000 --restart unless-stopped ghcr.io/YOUR_USERNAME/vermon:latest
 ```
 
-Configure GitHub secrets: `DEPLOY_KEY`, `DEPLOY_USER`, `DEPLOY_HOST`
+Configure GitHub secrets: `DEPLOY_KEY`, `DEPLOY_USER`, `DEPLOY_HOST`, `DEPLOY_HOST_PORT`, `TOKEN`
