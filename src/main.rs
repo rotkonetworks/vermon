@@ -22,6 +22,8 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use x509_parser::prelude::*;
+use rustls::pki_types::ServerName;
 use tokio::time::interval;
 use tracing::{error, info, warn};
 use tower_http::cors::CorsLayer;
@@ -33,6 +35,8 @@ struct Config {
     github_token: Option<String>,
     port: u16,
     max_retries: u32,
+    cert_warning_days: i64,
+    cert_critical_days: i64,
 }
 
 impl Default for Config {
@@ -45,6 +49,14 @@ impl Default for Config {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(3000),
             max_retries: 3,
+            cert_warning_days: std::env::var("CERT_WARNING_DAYS")
+                .ok()
+                .and_then(|d| d.parse().ok())
+                .unwrap_or(30),
+            cert_critical_days: std::env::var("CERT_CRITICAL_DAYS")
+                .ok()
+                .and_then(|d| d.parse().ok())
+                .unwrap_or(7),
         }
     }
 }
@@ -212,12 +224,26 @@ struct MemberInfo {
     runtime_version: Option<String>,
     client_version: Option<String>,
     last_checked: DateTime<Utc>,
+    cert_expires: Option<DateTime<Utc>>,
+    cert_days_left: Option<i64>,
+    latency_ms: Option<u64>,
+    response_time_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 struct MemberServices {
     provider: String,
     services: Vec<MemberInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VersionChange {
+    timestamp: DateTime<Utc>,
+    member: String,
+    network: String,
+    old_version: Option<String>,
+    new_version: Option<String>,
+    change_type: String, // "client", "runtime", "both"
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -375,6 +401,7 @@ struct AppState {
     usage_stats: Arc<UsageStats>,
     ibp_config: Arc<tokio::sync::RwLock<HashMap<String, IbpNetworkConfig>>>,
     ibp_members: Arc<tokio::sync::RwLock<HashMap<String, IbpMember>>>,
+    version_history: Arc<tokio::sync::RwLock<Vec<VersionChange>>>,
     gh: Octocrab,
     config: Config,
     start_time: DateTime<Utc>,
@@ -868,6 +895,10 @@ async fn fetch_member_prometheus_batch(member_id: String, networks: Vec<String>,
                                 runtime_version: extract_runtime_version(version),
                                 client_version: Some(version.clone()),
                                 last_checked: Utc::now(),
+                                cert_expires: None,
+                                cert_days_left: None,
+                                latency_ms: None,
+                                response_time_ms: None,
                             });
                             continue;
                         }
@@ -901,15 +932,23 @@ async fn fetch_member_http_batch(member_id: String, ip: String, networks: Vec<St
 
     let results = futures::future::join_all(futures).await;
 
+    // Check certificate expiry and latency once per member IP
+    let (cert_expires, cert_days_left) = check_certificate_expiry(&ip).await;
+    let latency_ms = measure_latency(&ip).await;
+
     for (network, result) in networks.into_iter().zip(results.into_iter()) {
         match result {
-            Ok((runtime_version, client_version)) => {
+            Ok((runtime_version, client_version, response_time)) => {
                 services.push(MemberInfo {
                     network: network.clone(),
                     ip: ip.clone(),
                     runtime_version: Some(runtime_version),
                     client_version: Some(client_version),
                     last_checked: Utc::now(),
+                    cert_expires,
+                    cert_days_left,
+                    latency_ms,
+                    response_time_ms: Some(response_time),
                 });
             }
             Err(_) => {
@@ -919,6 +958,10 @@ async fn fetch_member_http_batch(member_id: String, ip: String, networks: Vec<St
                     runtime_version: None,
                     client_version: None,
                     last_checked: Utc::now(),
+                    cert_expires,
+                    cert_days_left,
+                    latency_ms,
+                    response_time_ms: None,
                 });
             }
         }
@@ -927,7 +970,7 @@ async fn fetch_member_http_batch(member_id: String, ip: String, networks: Vec<St
     (member_id, services)
 }
 
-async fn fetch_node_info_http_optimized(client: &reqwest::Client, ip: &str, network: &str) -> Result<(String, String)> {
+async fn fetch_node_info_http_optimized(client: &reqwest::Client, ip: &str, network: &str) -> Result<(String, String, u64)> {
     let url = format!("https://{}:443", ip);
     let geodns_host = format!("{}.dotters.network", network);
 
@@ -937,14 +980,37 @@ async fn fetch_node_info_http_optimized(client: &reqwest::Client, ip: &str, netw
         ("X-Real-IP", "127.0.0.1"),
     ];
 
+    let start = std::time::Instant::now();
+
     for (header_name, header_value) in &strategies {
         match try_rpc_call(client, &url, header_name, header_value).await {
-            Ok(result) => return Ok(result),
+            Ok((runtime, client_ver)) => {
+                let response_time = start.elapsed().as_millis() as u64;
+                return Ok((runtime, client_ver, response_time));
+            },
             Err(_) => continue,
         }
     }
 
     Err(anyhow::anyhow!("All header strategies failed for {}", network))
+}
+
+async fn measure_latency(ip: &str) -> Option<u64> {
+    use tokio::time::{timeout, Instant};
+
+    let ping_future = async {
+        let start = Instant::now();
+        let addr = format!("{}:443", ip);
+        match tokio::net::TcpStream::connect(&addr).await {
+            Ok(_) => Some(start.elapsed().as_millis() as u64),
+            Err(_) => None,
+        }
+    };
+
+    match timeout(Duration::from_secs(3), ping_future).await {
+        Ok(result) => result,
+        Err(_) => None,
+    }
 }
 
 async fn try_rpc_call(client: &reqwest::Client, url: &str, header_name: &str, header_value: &str) -> Result<(String, String)> {
@@ -1000,6 +1066,43 @@ fn extract_runtime_version(version: &str) -> Option<String> {
         .captures(version)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
+}
+
+async fn check_certificate_expiry(ip: &str) -> (Option<DateTime<Utc>>, Option<i64>) {
+    use tokio::time::timeout;
+
+    let check_future = async {
+        let addr = format!("{}:443", ip);
+        let stream = tokio::net::TcpStream::connect(&addr).await?;
+
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let domain = ServerName::try_from(ip.to_string())
+            .map_err(|_| anyhow::anyhow!("Invalid domain"))?;
+
+        let tls_stream = connector.connect(domain, stream).await?;
+
+        if let Some(peer_certs) = tls_stream.get_ref().1.peer_certificates() {
+            if let Some(cert_der) = peer_certs.first() {
+                if let Ok((_, cert)) = parse_x509_certificate(cert_der.as_ref()) {
+                    if let Some(expiry) = DateTime::from_timestamp(cert.validity().not_after.timestamp(), 0) {
+                        let days_left = expiry.signed_duration_since(Utc::now()).num_days();
+                        return Ok((Some(expiry), Some(days_left)));
+                    }
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("No certificate found"))
+    };
+
+    match timeout(Duration::from_secs(5), check_future).await {
+        Ok(Ok(result)) => result,
+        _ => (None, None),
+    }
 }
 
 async fn refresh_all(state: Arc<AppState>) {
@@ -1316,6 +1419,79 @@ async fn get_usage_stats(
     Json(state.usage_stats.api_calls.iter().map(|e| (e.key().clone(), *e.value())).collect())
 }
 
+#[derive(Serialize)]
+struct HealthStats {
+    total_members: usize,
+    total_services: usize,
+    cert_warnings: usize,
+    cert_critical: usize,
+    cert_expired: usize,
+    avg_latency_ms: Option<f64>,
+    slow_services: usize,
+    unreachable_services: usize,
+}
+
+async fn get_health_stats(
+    State(state): State<Arc<AppState>>,
+) -> Json<HealthStats> {
+    track_usage(&state.usage_stats, "/api/health");
+
+    let mut total_services = 0;
+    let mut cert_warnings = 0;
+    let mut cert_critical = 0;
+    let mut cert_expired = 0;
+    let mut latencies = Vec::new();
+    let mut slow_services = 0;
+    let mut unreachable_services = 0;
+
+    for member_services in state.member_info.iter() {
+        for service in member_services.value().iter() {
+            total_services += 1;
+
+            // Certificate stats
+            if let Some(days_left) = service.cert_days_left {
+                if days_left < 0 {
+                    cert_expired += 1;
+                } else if days_left < state.config.cert_critical_days {
+                    cert_critical += 1;
+                } else if days_left < state.config.cert_warning_days {
+                    cert_warnings += 1;
+                }
+            }
+
+            // Latency stats
+            if let Some(latency) = service.latency_ms {
+                latencies.push(latency as f64);
+                if latency > 1000 {
+                    slow_services += 1;
+                }
+            }
+
+            // Unreachable check
+            if service.runtime_version.is_none() || service.client_version.is_none() {
+                unreachable_services += 1;
+            }
+        }
+    }
+
+    let avg_latency = if !latencies.is_empty() {
+        Some(latencies.iter().sum::<f64>() / latencies.len() as f64)
+    } else {
+        None
+    };
+
+    Json(HealthStats {
+        total_members: state.member_info.len(),
+        total_services,
+        cert_warnings,
+        cert_critical,
+        cert_expired,
+        avg_latency_ms: avg_latency,
+        slow_services,
+        unreachable_services,
+    })
+}
+
 async fn serve_ui() -> impl IntoResponse {
     (
         [("content-type", "text/html")],
@@ -1402,10 +1578,20 @@ const service=m.services.find(s=>s.network===item.network);
 const clientVer=service?service.client_version:null;
 const outdated=majorityVersion&&clientVer&&isSemverOutdated(clientVer,majorityVersion);
 const unreachable=!clientVer||clientVer==='?'||clientVer===null;
+const certDays=service?service.cert_days_left:null;
+const latency=service?service.latency_ms:null;
 let status='';
 let cssClass='';
 if(unreachable){status=' [unreachable]';cssClass=' class="unreachable"';}
 else if(outdated){status=' [!outdated]';cssClass=' class="outdated"';}
+if(certDays!==null&&certDays!==undefined){
+if(certDays<0)status+=' [CERT EXPIRED]';
+else if(certDays<7)status+=` [CERT ${certDays}d CRITICAL]`;
+else if(certDays<30)status+=` [CERT ${certDays}d]`;
+}
+if(latency!==null&&latency!==undefined){
+status+=latency>1000?' [SLOW]':latency>500?' [OK]':' [FAST]';
+}
 return `<span${cssClass}>${m.provider}: ${clientVer||'?'}${status}</span>`;
 }).join(' | ');
 const repoInfo=state.data.networks.find(n=>n.network===item.network);
@@ -1456,8 +1642,16 @@ if(unreachable)serviceClass+=' unreachable';
 else if(mismatch)serviceClass+=' invalid';
 else if(outdated)serviceClass+=' outdated';
 else serviceClass+=' valid';
+const certStatus=s.cert_days_left!==null&&s.cert_days_left!==undefined?
+(s.cert_days_left<0?' <span class="cert-expired">[CERT EXPIRED]</span>':
+s.cert_days_left<7?' <span class="cert-expired">[CERT '+s.cert_days_left+'d]</span>':
+s.cert_days_left<30?' <span class="cert-warning">[CERT '+s.cert_days_left+'d]</span>':''):'';
+const latencyStatus=s.latency_ms!==null&&s.latency_ms!==undefined?
+(s.latency_ms>1000?' <span class="latency-timeout">['+s.latency_ms+'ms]</span>':
+s.latency_ms>500?' <span class="latency-slow">['+s.latency_ms+'ms]</span>':
+' <span class="latency-fast">['+s.latency_ms+'ms]</span>'):'';
 return `<div class="${serviceClass}">
-${s.network}: ${s.runtime_version||'?'} | ${s.client_version||'?'}
+${s.network}: ${s.runtime_version||'?'} | ${s.client_version||'?'}${certStatus}${latencyStatus}
 </div>`;
 }).join('')}
 </div>`;
@@ -1601,6 +1795,7 @@ async fn main() -> Result<()> {
         member_info: Arc::new(DashMap::new()),
         ibp_config: ibp_config_map,
         ibp_members: ibp_members_map,
+        version_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         gh,
         config: config.clone(),
         start_time: Utc::now(),
@@ -1623,6 +1818,7 @@ async fn main() -> Result<()> {
         .route("/api/members", get(list_members))
         .route("/api/members/{provider}", get(get_member))
         .route("/api/stats", get(get_usage_stats))
+        .route("/api/health", get(get_health_stats))
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
