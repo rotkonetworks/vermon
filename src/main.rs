@@ -1,4 +1,4 @@
-use anyhow::{Context as _, Result};
+use anyhow::{anyhow, Context as _, Result};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -1707,6 +1707,11 @@ async fn serve_css() -> impl IntoResponse {
 //────────────────── Main
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize TLS crypto provider for certificate monitoring
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow!("Failed to install rustls crypto provider"))?;
+
     let _ = dotenvy::dotenv();
 
     tracing_subscriber::fmt()
@@ -1818,7 +1823,7 @@ async fn main() -> Result<()> {
         .route("/api/members", get(list_members))
         .route("/api/members/{provider}", get(get_member))
         .route("/api/stats", get(get_usage_stats))
-        .route("/api/health", get(get_health_stats))
+        .route("/api/health-stats", get(get_health_stats))
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
