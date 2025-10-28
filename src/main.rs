@@ -880,35 +880,61 @@ async fn fetch_member_prometheus_batch(member_id: String, networks: Vec<String>,
         .unwrap_or_else(|_| reqwest::Client::new());
 
     for network in networks {
-        let query = format!(r#"substrate_build_info{{name=~"{}.*", chain="{}"}}"#, member_id, network);
-        let url = format!("{}/api/v1/query?query={}", endpoint, urlencoding::encode(&query));
+        // Query for client version (substrate_build_info)
+        let build_query = format!(r#"substrate_build_info{{name=~"{}.*", chain="{}"}}"#, member_id, network);
+        let build_url = format!("{}/api/v1/query?query={}", endpoint, urlencoding::encode(&build_query));
 
-        match client.get(&url).send().await {
+        let client_version = match client.get(&build_url).send().await {
             Ok(response) => {
                 if let Ok(prom_response) = response.json::<PrometheusResponse>().await {
                     if let Some(result) = prom_response.data.result.first() {
-                        if let Some(version) = result.metric.get("version") {
-                            info!("Member {} - {}: client={} (from Prometheus)", member_id, network, version);
-                            services.push(MemberInfo {
-                                network: network.clone(),
-                                ip: "prometheus".to_string(),
-                                runtime_version: extract_runtime_version(version),
-                                client_version: Some(version.clone()),
-                                last_checked: Utc::now(),
-                                cert_expires: None,
-                                cert_days_left: None,
-                                latency_ms: None,
-                                response_time_ms: None,
-                            });
-                            continue;
-                        }
+                        result.metric.get("version").cloned()
+                    } else {
+                        None
                     }
+                } else {
+                    None
                 }
             }
-            Err(_) => {}
-        }
+            Err(_) => None,
+        };
 
-        warn!("Prometheus query failed for {} on {}", member_id, network);
+        // Query for runtime version (substrate_runtime_spec_version)
+        let runtime_query = format!(r#"substrate_runtime_spec_version{{name=~"{}.*", chain="{}"}}"#, member_id, network);
+        let runtime_url = format!("{}/api/v1/query?query={}", endpoint, urlencoding::encode(&runtime_query));
+
+        let runtime_version = match client.get(&runtime_url).send().await {
+            Ok(response) => {
+                if let Ok(prom_response) = response.json::<PrometheusResponse>().await {
+                    if let Some(result) = prom_response.data.result.first() {
+                        Some(result.value.1.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        };
+
+        if client_version.is_some() || runtime_version.is_some() {
+            info!("Member {} - {}: runtime={:?}, client={:?} (from Prometheus)",
+                  member_id, network, runtime_version, client_version);
+            services.push(MemberInfo {
+                network: network.clone(),
+                ip: "prometheus".to_string(),
+                runtime_version,
+                client_version,
+                last_checked: Utc::now(),
+                cert_expires: None,
+                cert_days_left: None,
+                latency_ms: None,
+                response_time_ms: None,
+            });
+        } else {
+            warn!("Prometheus query failed for {} on {} - no version data found", member_id, network);
+        }
     }
 
     (member_id, services)
@@ -1504,7 +1530,7 @@ async fn serve_ui() -> impl IntoResponse {
 </head>
 <body>
 <div class="terminal">
-<div class="header">vermon v0.4.2</div>
+<div class="header">vermon v0.4.2 | <a href="/docs" style="color:#0ff;text-decoration:none">API Docs</a></div>
 <div class="controls">
 <button id="view-toggle">by network</button>
 <input id="filter" type="text" placeholder="filter">
@@ -1704,6 +1730,147 @@ async fn serve_css() -> impl IntoResponse {
     )
 }
 
+async fn serve_api_docs() -> impl IntoResponse {
+    (
+        [("content-type", "text/html")],
+        r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>vermon API Documentation</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+body{background:#000;color:#0f0;font-family:monospace;font-size:14px;padding:20px;max-width:1200px;margin:0 auto}
+h1,h2{color:#0f0;margin:20px 0 10px}
+.endpoint{background:#111;border-left:3px solid #0f0;padding:15px;margin:15px 0;border-radius:3px}
+.method{color:#ff0;font-weight:bold}
+.path{color:#0ff}
+.description{color:#aaa;margin:5px 0}
+a{color:#0f0;text-decoration:none}
+a:hover{text-decoration:underline}
+.section{margin:30px 0}
+.note{background:#220;border-left:3px solid #f80;padding:10px;margin:10px 0}
+</style>
+</head>
+<body>
+<h1>vermon API Documentation</h1>
+<p>Node version monitoring for blockchain networks</p>
+
+<div class="note">
+<strong>Purpose:</strong> This API tracks blockchain node versions across networks and IBP members.
+The runtime version indicates blockchain protocol compatibility - nodes with different runtime versions may not be compatible with the network.
+</div>
+
+<div class="section">
+<h2>Version Monitoring</h2>
+
+<div class="endpoint">
+<div><span class="method">GET</span> <span class="path"><a href="/api/compare">/api/compare</a></span></div>
+<div class="description">Compare repository versions with on-chain versions for all networks. Shows version mismatches.</div>
+</div>
+
+<div class="endpoint">
+<div><span class="method">GET</span> <span class="path"><a href="/api/compare/polkadot">/api/compare/{network}</a></span></div>
+<div class="description">Compare versions for a specific network (e.g., polkadot, kusama, asset-hub-polkadot)</div>
+</div>
+
+<div class="endpoint">
+<div><span class="method">GET</span> <span class="path"><a href="/api/networks">/api/networks</a></span></div>
+<div class="description">List all monitored networks with their version info. Use ?include_empty=true to include networks without data.</div>
+</div>
+
+<div class="endpoint">
+<div><span class="method">GET</span> <span class="path"><a href="/api/networks/polkadot">/api/networks/{network}</a></span></div>
+<div class="description">Get version information for a specific network</div>
+</div>
+</div>
+
+<div class="section">
+<h2>IBP Members</h2>
+
+<div class="endpoint">
+<div><span class="method">GET</span> <span class="path"><a href="/api/members">/api/members</a></span></div>
+<div class="description">List all IBP members with their node versions, certificate status, and latency</div>
+</div>
+
+<div class="endpoint">
+<div><span class="method">GET</span> <span class="path"><a href="/api/members/rotko">/api/members/{provider}</a></span></div>
+<div class="description">Get detailed information for a specific IBP member</div>
+</div>
+</div>
+
+<div class="section">
+<h2>Repository Info</h2>
+
+<div class="endpoint">
+<div><span class="method">GET</span> <span class="path"><a href="/api/repos">/api/repos</a></span></div>
+<div class="description">List all monitored GitHub repositories and their latest release versions</div>
+</div>
+
+<div class="endpoint">
+<div><span class="method">GET</span> <span class="path"><a href="/api/repos/paritytech/polkadot-sdk">/api/repos/{owner}/{name}</a></span></div>
+<div class="description">Get latest release info for a specific repository</div>
+</div>
+</div>
+
+<div class="section">
+<h2>Health & Stats</h2>
+
+<div class="endpoint">
+<div><span class="method">GET</span> <span class="path"><a href="/api/health">/api/health</a></span></div>
+<div class="description">System health status and uptime</div>
+</div>
+
+<div class="endpoint">
+<div><span class="method">GET</span> <span class="path"><a href="/api/health-stats">/api/health-stats</a></span></div>
+<div class="description">Aggregated health statistics across all members (cert warnings, latency, unreachable nodes)</div>
+</div>
+
+<div class="endpoint">
+<div><span class="method">GET</span> <span class="path"><a href="/api/stats">/api/stats</a></span></div>
+<div class="description">API usage statistics</div>
+</div>
+
+<div class="endpoint">
+<div><span class="method">GET</span> <span class="path">/api/refresh</span></div>
+<div class="description">Trigger manual data refresh (rate limited to once per minute)</div>
+</div>
+</div>
+
+<div class="section">
+<h2>Response Examples</h2>
+
+<h3>Version Comparison</h3>
+<pre style="background:#111;padding:10px;overflow-x:auto">{
+  "network": "polkadot",
+  "repository_version": "2024.09.1",
+  "repository_tag": "polkadot-stable2509-1",
+  "runtime_version": "1007001",
+  "client_version": "1.20.1-bd19559e1fa",
+  "matches": false,
+  "last_checked": "2025-10-27T23:50:00Z"
+}</pre>
+
+<h3>Member Info</h3>
+<pre style="background:#111;padding:10px;overflow-x:auto">{
+  "provider": "rotko",
+  "services": [{
+    "network": "polkadot",
+    "ip": "prometheus",
+    "runtime_version": "1007001",
+    "client_version": "1.20.1-bd19559e1fa",
+    "cert_days_left": 45,
+    "latency_ms": 23
+  }]
+}</pre>
+</div>
+
+<p style="margin-top:40px"><a href="/">← Back to Dashboard</a></p>
+</body>
+</html>"#
+    )
+}
+
 //────────────────── Main
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1811,6 +1978,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(serve_ui))
+        .route("/docs", get(serve_api_docs))
         .route("/style.css", get(serve_css))
         .route("/api/health", get(health))
         .route("/api/networks", get(list_networks))
