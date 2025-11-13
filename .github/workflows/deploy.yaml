@@ -19,6 +19,8 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ghcr.io/${{ github.repository }}:latest
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
       - name: Deploy to server
         run: |
           echo "${{ secrets.DEPLOY_KEY }}" > ssh_key
