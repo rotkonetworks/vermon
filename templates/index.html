@@ -125,7 +125,8 @@ return severity==='err';
 }).length;
 
 // Only use reachable members for status - unreachable don't count as errors
-const statusClass=mismatch?'err':criticalMembers>0?'err':outdatedMembers>0?'warn':'ok';
+// Status based on member versions only, not repo/runtime format differences
+const statusClass=criticalMembers>0?'err':outdatedMembers>0?'warn':'ok';
 const statusText=pad(`${reachableMembers}${outdatedMembers>0?' │'+outdatedMembers+' old':''}`,14);
 
 out+=`<div class="box-row ${statusClass}" onclick="toggleDetails('${item.network}')">`;
