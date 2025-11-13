@@ -16,7 +16,26 @@
 <div id="data"></div>
 </div>
 <script>
-const state={view:'network',filter:'',data:{networks:[],members:[],compare:[]}};
+// Parse URL parameters
+function getUrlParams(){
+const params=new URLSearchParams(window.location.search);
+return {
+view:params.get('view')||'network',
+filter:params.get('filter')||''
+};
+}
+
+// Update URL without page reload
+function updateUrl(){
+const params=new URLSearchParams();
+if(state.view!=='network')params.set('view',state.view);
+if(state.filter)params.set('filter',state.filter);
+const newUrl=params.toString()?`?${params.toString()}`:window.location.pathname;
+window.history.replaceState({},'',newUrl);
+}
+
+const urlParams=getUrlParams();
+const state={view:urlParams.view,filter:urlParams.filter,data:{networks:[],members:[],compare:[]}};
 
 function parseVersion(v){
 if(!v)return null;
@@ -194,13 +213,19 @@ document.getElementById('status').textContent='error: '+e.message;
 document.getElementById('view-toggle').onclick=()=>{
 state.view=state.view==='network'?'member':'network';
 document.getElementById('view-toggle').textContent='by '+state.view;
+updateUrl();
 render();
 };
 
 document.getElementById('filter').oninput=e=>{
 state.filter=e.target.value;
+updateUrl();
 render();
 };
+
+// Set initial UI state from URL
+document.getElementById('view-toggle').textContent='by '+state.view;
+document.getElementById('filter').value=state.filter;
 
 fetchData();
 setInterval(fetchData,30000);
