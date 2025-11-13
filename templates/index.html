@@ -116,8 +116,16 @@ const s=m.services.find(srv=>srv.network===item.network);
 return majorityVersion&&s&&s.client_version&&s.client_version!=='?'&&isSemverOutdated(s.client_version,majorityVersion);
 }).length;
 
+// Check if any outdated members have critical issues (major/minor behind)
+const criticalMembers=networkMembers.filter(m=>{
+const s=m.services.find(srv=>srv.network===item.network);
+if(!majorityVersion||!s||!s.client_version||s.client_version==='?')return false;
+const severity=getVersionSeverity(s.client_version,majorityVersion);
+return severity==='err';
+}).length;
+
 // Only use reachable members for status - unreachable don't count as errors
-const statusClass=mismatch?'err':outdatedMembers>0?'warn':'ok';
+const statusClass=mismatch?'err':criticalMembers>0?'err':outdatedMembers>0?'warn':'ok';
 const statusText=pad(`${reachableMembers}${outdatedMembers>0?' │'+outdatedMembers+' old':''}`,14);
 
 out+=`<div class="box-row ${statusClass}" onclick="toggleDetails('${item.network}')">`;
