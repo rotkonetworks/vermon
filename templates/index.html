@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>vermon</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="terminal">
+<div class="header">vermon v{{ version }} | <a href="/docs" style="color:#0ff;text-decoration:none">API Docs</a></div>
+<div class="controls">
+<button id="view-toggle">by network</button>
+<input id="filter" type="text" placeholder="filter">
+</div>
+<div id="status"></div>
+<div id="data"></div>
+</div>
+<script>
+const state={view:'network',filter:'',data:{networks:[],members:[],compare:[]}};
+
+function parseVersion(v){
+if(!v)return null;
+const match=v.match(/(\d+)\.(\d+)\.(\d+)/);
+return match?{major:parseInt(match[1]),minor:parseInt(match[2]),patch:parseInt(match[3]),raw:v}:null;
+}
+function isVersionMismatch(item){
+if(!item.repository_version||!item.runtime_version)return false;
+return item.repository_version!==item.runtime_version;
+}
+function isSemverOutdated(memberVersion,networkVersion){
+const mv=parseVersion(memberVersion);
+const nv=parseVersion(networkVersion);
+if(!mv||!nv)return false;
+if(mv.major!==nv.major)return mv.major<nv.major;
+if(mv.minor!==nv.minor)return mv.minor<nv.minor;
+return mv.patch<nv.patch;
+}
+
+function getVersionSeverity(memberVersion,networkVersion){
+const mv=parseVersion(memberVersion);
+const nv=parseVersion(networkVersion);
+if(!mv||!nv)return 'unreachable';
+// Major version different = critical (red)
+if(mv.major!==nv.major)return mv.major<nv.major?'err':'ok';
+// Minor version different = warning (yellow)
+if(mv.minor!==nv.minor)return mv.minor<nv.minor?'warn':'ok';
+// Patch version different = minor warning (yellow)
+if(mv.patch!==nv.patch)return mv.patch<nv.patch?'warn':'ok';
+return 'ok';
+}
+
+function getMajorityVersion(versions){
+const validVersions=versions.filter(v=>v&&v!=='?'&&v!==null);
+if(validVersions.length===0)return null;
+const counts=validVersions.reduce((acc,v)=>{acc[v]=(acc[v]||0)+1;return acc},{});
+return Object.keys(counts).reduce((a,b)=>counts[a]>counts[b]?a:b);
+}
+function isLevel6Network(networkName){
+const level6Networks=['acala','ajuna','bifrost-polkadot','hydration','nexus','kilt','moonbeam','mythos','polimec','unique','xcavate'];
+return level6Networks.includes(networkName.toLowerCase());
+}
+
+function pad(str,len){return(str||'?').substring(0,len).padEnd(len,' ');}
+
+function renderNetworkView(){
+if(!state.data.compare.length)return '<div>loading...</div>';
+const filtered=state.data.compare.filter(item=>
+state.filter===''||item.network.toLowerCase().includes(state.filter.toLowerCase()));
+
+const relayChains=filtered.filter(item=>['polkadot','kusama','paseo'].includes(item.network.toLowerCase()));
+const systemChains=filtered.filter(item=>item.network.toLowerCase().includes('-hub')||item.network.toLowerCase().includes('collectives')||item.network.toLowerCase().includes('coretime')||item.network.toLowerCase().includes('people')||item.network.toLowerCase().includes('encointer'));
+const level6Networks=filtered.filter(item=>isLevel6Network(item.network));
+const otherNetworks=filtered.filter(item=>!['polkadot','kusama','paseo'].includes(item.network.toLowerCase())&&!item.network.toLowerCase().includes('-hub')&&!item.network.toLowerCase().includes('collectives')&&!item.network.toLowerCase().includes('coretime')&&!item.network.toLowerCase().includes('people')&&!item.network.toLowerCase().includes('encointer')&&!isLevel6Network(item.network));
+
+function renderNetworkGroup(networks,title){
+if(!networks.length)return '';
+let out=`<div class="table-box">`;
+out+=`<div class="box-title">╔═══ ${title} (${networks.length}) ${'═'.repeat(Math.max(0,93-title.length-String(networks.length).length))}╗</div>`;
+out+=`<div class="box-header">║ Network               │ Repo Ver  │ Runtime   │ Majority Client       │ Status       ║</div>`;
+out+=`<div class="box-divider">╟───────────────────────┼───────────┼───────────┼───────────────────────┼──────────────╢</div>`;
+
+networks.forEach(item=>{
+const mismatch=isVersionMismatch(item);
+const networkMembers=state.data.members.filter(m=>m.services.some(s=>s.network===item.network));
+const clientVersions=networkMembers.map(m=>{
+const service=m.services.find(s=>s.network===item.network);
+return service?service.client_version:null;
+}).filter(v=>v&&v!=='?'&&v!==null);
+const majorityVersion=getMajorityVersion(clientVersions);
+const totalMembers=networkMembers.length;
+const reachableMembers=networkMembers.filter(m=>{
+const s=m.services.find(srv=>srv.network===item.network);
+return s&&s.client_version&&s.client_version!=='?';
+}).length;
+const outdatedMembers=networkMembers.filter(m=>{
+const s=m.services.find(srv=>srv.network===item.network);
+return majorityVersion&&s&&s.client_version&&isSemverOutdated(s.client_version,majorityVersion);
+}).length;
+
+const statusClass=mismatch?'err':reachableMembers<totalMembers?'warn':'ok';
+const statusText=pad(`${reachableMembers}/${totalMembers}${outdatedMembers>0?' │'+outdatedMembers+' old':''}`,14);
+
+out+=`<div class="box-row ${statusClass}" onclick="toggleDetails('${item.network}')">`;
+out+=`║ ${pad(item.network,21)} │ ${pad(item.repository_version,9)} │ ${pad(item.runtime_version,9)} │ ${pad(majorityVersion,21)} │ ${statusText} ║`;
+out+=`</div>`;
+out+=`<div id="details-${item.network}" class="details" style="display:none">`;
+networkMembers.forEach(m=>{
+const s=m.services.find(srv=>srv.network===item.network);
+const cv=s?s.client_version:null;
+const rv=s?s.runtime_version:null;
+const unreachable=!cv||cv==='?'||!rv||rv==='?';
+const cls=unreachable?'unreachable':getVersionSeverity(cv,majorityVersion);
+out+=`<div class="detail-row ${cls}">║   → ${pad(m.provider,17)} │ RT:${pad(rv,7)} │ CL:${pad(cv,45)} ║</div>`;
+});
+out+=`</div>`;
+});
+
+out+=`<div class="box-footer">╚${'═'.repeat(99)}╝</div>`;
+out+=`</div>`;
+return out;
+}
+
+return [
+renderNetworkGroup(relayChains,'Relay Chains'),
+renderNetworkGroup(systemChains,'System Chains'),
+renderNetworkGroup(level6Networks,'Level 6 Parachains'),
+renderNetworkGroup(otherNetworks,'Other Networks')
+].filter(g=>g).join('');
+}
+
+function toggleDetails(network){
+const el=document.getElementById('details-'+network);
+if(el)el.style.display=el.style.display==='none'?'block':'none';
+}
+
+function renderMemberView(){
+if(!state.data.members.length)return '<div>loading...</div>';
+const filtered=state.data.members.filter(member=>
+state.filter===''||member.provider.toLowerCase().includes(state.filter.toLowerCase()));
+
+let out='<div class="table-box">';
+out+=`<div class="box-title">╔═══ IBP Members (${filtered.length}) ${'═'.repeat(Math.max(0,87-String(filtered.length).length))}╗</div>`;
+out+=`<div class="box-header">║ Provider            │ Network               │ Runtime   │ Client Version            ║</div>`;
+out+=`<div class="box-divider">╟─────────────────────┼───────────────────────┼───────────┼───────────────────────────╢</div>`;
+
+filtered.forEach(member=>{
+member.services.forEach((s,idx)=>{
+const compItem=state.data.compare.find(c=>c.network===s.network);
+const mismatch=compItem&&s.runtime_version&&compItem.runtime_version&&s.runtime_version!==compItem.runtime_version;
+const unreachable=!s.runtime_version||s.runtime_version==='?'||!s.client_version||s.client_version==='?';
+const networkMembers=state.data.members.filter(m=>m.services.some(srv=>srv.network===s.network));
+const clientVersions=networkMembers.map(m=>{
+const service=m.services.find(srv=>srv.network===s.network);
+return service?service.client_version:null;
+}).filter(v=>v&&v!=='?'&&v!==null);
+const majorityVersion=getMajorityVersion(clientVersions);
+let cls;
+if(unreachable){
+cls='unreachable';
+}else if(mismatch){
+cls='err';
+}else{
+cls=getVersionSeverity(s.client_version,majorityVersion);
+}
+const providerName=idx===0?member.provider:'';
+out+=`<div class="box-row ${cls}">║ ${pad(providerName,19)} │ ${pad(s.network,21)} │ ${pad(s.runtime_version,9)} │ ${pad(s.client_version,25)} ║</div>`;
+});
+});
+
+out+=`<div class="box-footer">╚${'═'.repeat(99)}╝</div>`;
+out+=`</div>`;
+return out;
+}
+
+function render(){
+document.getElementById('data').innerHTML=state.view==='network'?renderNetworkView():renderMemberView();
+}
+
+async function fetchData(){
+try{
+const[networks,members,compare]=await Promise.all([
+fetch('/api/networks').then(r=>r.json()),
+fetch('/api/members').then(r=>r.json()),
+fetch('/api/compare').then(r=>r.json())
+]);
+state.data={networks,members,compare};
+render();
+document.getElementById('status').textContent=`${compare.length} networks | ${members.length} members`;
+}catch(e){
+document.getElementById('status').textContent='error: '+e.message;
+}
+}
+
+document.getElementById('view-toggle').onclick=()=>{
+state.view=state.view==='network'?'member':'network';
+document.getElementById('view-toggle').textContent='by '+state.view;
+render();
+};
+
+document.getElementById('filter').oninput=e=>{
+state.filter=e.target.value;
+render();
+};
+
+fetchData();
+setInterval(fetchData,30000);
+</script>
+</body>
+</html>

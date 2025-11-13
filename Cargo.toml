@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow   = "1"
+askama   = "0.12"
 axum     = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "query"] }
 chrono   = { version = "0.4", features = ["serde"] }
 dashmap  = "6"
